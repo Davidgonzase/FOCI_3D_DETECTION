@@ -14,9 +14,11 @@ from matplotlib.path import Path
 from collections import deque
 import config
 
+#Variables loaded from Config, assignment needed for correct 
 dir_blue = config.dir_blue
 dir_canal_c2 = config.dir_canal_c2
 
+#Function for loading tiff images using tifffile based on a path, used to read DAPI and FISH images
 def load_img(path):  
     temp=[]
     for filename in sorted(os.listdir(path)):
@@ -25,13 +27,15 @@ def load_img(path):
             temp.append((filename, img))
     return temp
 
-
+#As much ROI as needed
+#IMPORTANT, SET IN CONFIG !!!
 region1cords = config.region1cords
 region2cords = config.region2cords
 region3cords = config.region3cords
 
 pathregions = []
 
+#IMPORTANT!! CREATE AS MUCH REGIONS AND APPEND AS ROI NEEDED IN CONFIG
 region1 = Path(region1cords)
 region2= Path(region2cords)
 region3 = Path(region3cords)
@@ -40,6 +44,7 @@ pathregions.append(region1)
 pathregions.append(region2)
 pathregions.append(region3)
 
+#Functions for FOCI count provided by Alex Bernadí
 def count_foci(img):
     intensities = sorted(set(img.flatten()), reverse=True)
     foci_pos = []
@@ -82,6 +87,7 @@ def count_group_foci(foci_pos):
 
 id = 0
 
+#Main class for cell compositicon which contains cell slices, id and ROI based on given
 class Fullcell:
     _id_counter = 0
     def __init__(self,region):
@@ -89,7 +95,18 @@ class Fullcell:
         self.idcell = Fullcell._id_counter
         self.cells = []
         self.region=region
-    
+
+#Main class for cell slice with the following attributes:
+#Coords: Set of coordinates that form the geometric figure corresponding to the layer
+#Centroid: Coordinates corresponding to the geometric center of the evaluated layer
+#Area: Size in square pixels of the area occupied by the layer.
+#Locallabel: Identifier created during segmentation, it is not unique in the stack since the classification process is restarted for each iteration of the segmentation program, so the same identifier can be in several levels at once
+#Bbox: The bbox are the coordinates that form the rectangle where the layer is located in the image
+#Id: Unique value for each independent cell layer, used to uniquely identify layers
+#Level: Corresponding to the position in the stack where the image in which the evaluated layer is located is located
+#Lastcandidates: List of candidates who are levels above, the local identifier of the region is stored
+#Newcandidates: List of candidates who are levels below, the local identifier of the region is stored
+
 class Cell:
     _id_counter = 0
     def __init__(self, coords, centroid, level, area, locallabel, bbox):
@@ -108,39 +125,47 @@ class Cell:
     def addnew(self, id):
         self.newcandidates.append(id)
 
+#Fucntion for Watershed and OTSU segmentation
 
 def seg_img(imgblue):
+    #List to store all detected regions at the end of the segmentation
     allregions = []
+    
+    #For each image in the stack
     for name, img in imgblue:
+        #Normalization, contrast enhancement, and grayscale switching
         img_norm = (img - img.min()) / (img.max() - img.min())
         enhanced = exposure.equalize_adapthist(img_norm)
         gray = (enhanced * 255).astype(np.uint8)
-        thresh_value = threshold_otsu(gray)
         
+        #OTSU segmentation based from area study, if resolution and zoom changed another study will be needed to changed min_size so cleaning is done, number used rounding down the lowest number and applying 15% threshold
+        thresh_value = threshold_otsu(gray)
         binary = gray > thresh_value
         binary = remove_small_objects(binary, min_size=68)
         
+        #Local maxima based on mean radius and diameter from the previus study, same as before if images changed another study must be conducted assuming cells as circles
         distance = ndi.distance_transform_edt(binary)
-        
         coords = peak_local_max(
         distance, 
         labels=binary, 
         footprint=np.ones((15, 15)), 
         min_distance=7)
-        
         local_maxi = np.zeros_like(distance, dtype=bool)
         local_maxi[tuple(coords.T)] = True
         markers = ndi.label(local_maxi)[0]
         
+        #Appliying the local maxima to watershed
         labels = watershed(-distance, markers, mask=binary)
         refined_labels = np.zeros_like(labels)
         
+        #Exclusion area based in the previous area threshold to exlude errors in Watershed, as always based on the mean area, change if needed
         for region in regionprops(labels):
             if region.area > 68:
                 refined_labels[labels == region.label] = region.label
                 
         regions = regionprops(refined_labels)
 
+        #Exlusion based on ROI coords previously provided
         localregions = []
         
         for region in regions:
@@ -157,64 +182,87 @@ def seg_img(imgblue):
         allregions.append(localregions)
     return allregions
     
+#Fucntion for conflict assignment
 
 def assign_conflicts(regions):
     cellist = []
+    #For evety localregion
     for level in range(len(regions)):
         currentlevel = regions[level]
         for candidate in currentlevel:
+            #Create cell and obtain coords set for intersection comparations
             temp = Cell(candidate.coords,candidate.centroid,level,candidate.area,candidate.label,candidate.bbox)
             candidate_coords_set = set(map(tuple, candidate.coords))
-
+            
+            #In case first not compare to nothing above
             if level != 0:
                 previous_level = regions[level - 1]
+                #For every cell in the previous level
                 for prev in previous_level:
+                    #Extact coords and based on how many pixels intersect and the area calc the overlap 
                     prev_coords_set = set(map(tuple, prev.coords))
                     intersection = candidate_coords_set & prev_coords_set
                     overlap_ratio = len(intersection) / candidate.area
+                    #Overlap ratio considered, is best to make a study based over all
                     if overlap_ratio >= 0.5:
+                        #Add the conflict to cell
                         temp.addlast(prev.label)
-
+                        
+            #In case last not compare to nothing below
             if level < len(regions) - 1:
                 next_level = regions[level + 1]
+                #For every cell in the next level
                 for nxt in next_level:
                     nxt_coords_set = set(map(tuple, nxt.coords))
                     intersection = candidate_coords_set & nxt_coords_set
                     overlap_ratio = len(intersection) / candidate.area
+                    #Overlap ratio considered, is best to make a study based over all
                     if overlap_ratio >= 0.5:
+                        # the conflict to cell
                         temp.addnew(nxt.label)
 
             cellist.append(temp)
     return cellist
 
+#Fucntion for assigning cells
 
 def assign_cells(cellist):
+    #Final cells and cells that where read
     final_fullcells = []
     used_labels = set()
-
+    
+    #For every cell
     for cell in cellist:
+        #Dont read if already
         if cell.locallabel in used_labels:
             continue
         
+        #Create chain 
         forward_chain = [cell]
         valid_chain = True
         current = cell
 
+        #If has candidates foward
         while current.newcandidates:
+            #Discard imperfect
             if len(current.newcandidates) > 1:
                 valid_chain = False
                 break
+            #Search for conflicts in next cell
             next_label = current.newcandidates[0]
             next_cell = next((c for c in cellist if c.locallabel == next_label and c.level == current.level + 1), None)
+            #Dont add not broken chains or duplicated conflicts 
             if not next_cell or next_cell.locallabel in used_labels:
                 valid_chain = False
                 break
+            #Discard if it has folowing conflicts on same level
             if len(next_cell.lastcandidates) > 1:
                 valid_chain = False
                 break
             forward_chain.append(next_cell)
             current = next_cell
 
+        #Same but with following level
         current = cell
         backward_chain = []
         while current.lastcandidates:
@@ -232,10 +280,12 @@ def assign_cells(cellist):
             backward_chain.append(prev_cell)
             current = prev_cell
 
+        #If valid create fullcell 
         if valid_chain:
             region=0
             y, x = cell.centroid
             cords = (x, y)
+            #Assing region
             for localregion in pathregions:
                 region=region+1
                 if localregion.contains_point(cords):
@@ -247,10 +297,12 @@ def assign_cells(cellist):
             final_fullcells.append(fullcell)
     return final_fullcells
 
+#Fucntion for FISH crop extraction and cell FOCI count
 
 def count_all_foci(final_fullcells,imagesred):
     result_foci = []
     for fullcell in final_fullcells:
+        #Creating general bbox with the min and max levels of all slice
         minr_total = min(c.bbox[0] for c in fullcell.cells)
         minc_total = min(c.bbox[1] for c in fullcell.cells)
         maxr_total = max(c.bbox[2] for c in fullcell.cells)
@@ -258,38 +310,49 @@ def count_all_foci(final_fullcells,imagesred):
         h = maxr_total - minr_total
         w = maxc_total - minc_total
 
+        #List for creating all the crops and masks
         aligned_crops = []
         aligned_masks = []
 
+        #For all slices in the cell
         for cell in fullcell.cells:
             level = cell.level
+            #Extract content from red FISH images
             img_red = imagesred[level][1]
             minr, minc, maxr, maxc = cell.bbox
+            
+            #Create crop and mask
             crop = img_red[minr:maxr, minc:maxc]
             mask = np.zeros_like(crop, dtype=bool)
             
+            #In order to not let any other posible near cells a mask with the slice postiion will be placed
             for r, c_ in cell.coords:
                 mask[r - minr, c_ - minc] = True
 
+            #Creation of the local bbox
             aligned_crop = np.zeros((h, w), dtype=crop.dtype)
             aligned_mask = np.zeros((h, w), dtype=bool)
             r_offset = minr - minr_total
             c_offset = minc - minc_total
+            #Place mask and crop with the content of the red FISH img
             aligned_crop[r_offset:r_offset + crop.shape[0], c_offset:c_offset + crop.shape[1]] = crop
             aligned_mask[r_offset:r_offset + mask.shape[0], c_offset:c_offset + mask.shape[1]] = mask
 
             aligned_crops.append(aligned_crop)
             aligned_masks.append(aligned_mask)
-
+            
+        #Compute mask intersections
         mask_intersection = np.logical_and.reduce(aligned_masks)
-
+        #Sum all crops
         summed_crop = np.sum(aligned_crops, axis=0)
-
+        #Place masks on top of crops
         masked_crop = np.where(mask_intersection, summed_crop, 0)
         
+        #Apply FOCI count functions
         foci_count, foci_pos, foci_area = count_foci(masked_crop)
         foci_group_count = count_group_foci([f[0] for f in foci_pos])
 
+        #FOCi results for CSV
         result_foci.append({
             "ID": fullcell.idcell,
             "Foci_Count": foci_count,
@@ -302,10 +365,13 @@ def count_all_foci(final_fullcells,imagesred):
         
     return result_foci
 
-def results_CSV(resultados_foci):
-    df = pd.DataFrame(resultados_foci)
+#Fucntion to transform results into CSV
+
+def results_CSV(foci_results):
+    df = pd.DataFrame(foci_results)
     df.to_csv("result_foci.csv", index=False)
 
+#Functionality based on methodology
 
 def main():
     images_blue = load_img(dir_blue)
